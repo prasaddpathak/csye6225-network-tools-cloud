@@ -1,0 +1,104 @@
+name: Packer Publish AMI
+
+on:
+  push:
+    branches: [ "main" ]
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Packer Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+
+      - name: Creating .env file
+        working-directory: ./server
+        run: |
+          touch .env
+          echo PORT=3000 >> .env
+          echo MYSQL_HOST="localhost" >> .env
+          echo USER_ID="node-server" >> .env
+          echo USER_PASS="password" >> .env
+          cat .env
+
+      - name: Zipping webapp
+        run: zip -r webapp.zip server
+        
+      - name: Packer init
+        uses: hashicorp/packer-github-actions@master
+        with:
+          command: init
+          target: ami.pkr.hcl
+          
+      - name: Validate packer template
+        uses: hashicorp/packer-github-actions@master
+        with:
+          command: validate
+          target: ami.pkr.hcl
+
+      - name: Build Packer Artifact
+        uses: hashicorp/packer-github-actions@master
+        with:
+          command: build
+          arguments: "-color=false -on-error=abort -var source_ami=${{ secrets.UBUNTU_AMI_ID }} -var volume_size=${{ secrets.VOLUME_SIZE }}"
+          target: ami.pkr.hcl
+        env:
+          PACKER_LOG: 1
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_DEFAULT_OUTPUT: json
+          
+      - name: Configure AWS credentials for Prod account
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region: us-east-1
+      
+      - name: Update AWS Launch Template Config and Refresh Instances
+        run: |
+
+          # Install jq to parse JSON data and map it to the shell variable
+          # sudo apt-get install jq
+
+          ASG_NAME="webappAutoScaling"
+          LAUNCH_CONFIG="asg_launch_config"
+
+          IMAGE=$(jq -r '.builds[-1].artifact_id' manifest.json | cut -d':' -f2)
+
+          IMAGE_ID=$(jq -n \
+            --arg img "$IMAGE" \
+            '{"ImageId": $img}')
+
+          aws ec2 create-launch-template-version \
+            --launch-template-name "$LAUNCH_CONFIG" \
+            --version-description updateAMI --source-version 1 \
+            --launch-template-data="$IMAGE_ID"
+
+          # Update Auto Scaling Group to use new Launch Configuration with the latest version
+          aws autoscaling update-auto-scaling-group --auto-scaling-group-name $ASG_NAME \
+            --launch-template LaunchTemplateName="$LAUNCH_CONFIG",Version='$Latest'
+
+          # Start instance refresh
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name $ASG_NAME
+
+          while true; do
+            instance_refresh_status=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name $ASG_NAME \
+              --query "InstanceRefreshes[0].Status" --output text)
+            if [ "$instance_refresh_status" = "Successful" ]; then
+              echo "Instance refresh successful!"
+              break
+            fi
+            if [ "$instance_refresh_status" = "Cancelling" ] || [ "$instance_refresh_status" = "Cancelled" ] || [ "$instance_refresh_status" = "Failed" ]; then
+              echo "Instance refresh failed!"
+              exit 1
+            fi
+            sleep 10
+          done
+          

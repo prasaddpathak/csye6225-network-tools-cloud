@@ -1,0 +1,14 @@
+[Unit]
+Description=Webapp - Running the webapp on start
+Documentation=https://github.com/Prasad-Pathak-002925486/webapp
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/usr/bin/node /home/ubuntu/webapp/server/index.js
+EnvironmentFile=/home/ubuntu/webapp/server/.env
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
